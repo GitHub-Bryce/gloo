@@ -5,13 +5,17 @@ import (
 	"fmt"
 	"net"
 
+	"github.com/solo-io/gloo/pkg/utils"
+
 	pb "github.com/envoyproxy/go-control-plane/envoy/service/accesslog/v2"
 	"github.com/solo-io/gloo/projects/accesslogger/pkg/loggingservice"
 	"github.com/solo-io/go-utils/contextutils"
 	"github.com/solo-io/go-utils/healthchecker"
 	"github.com/solo-io/go-utils/stats"
 	"go.opencensus.io/plugin/ocgrpc"
+	ocstats "go.opencensus.io/stats"
 	"go.opencensus.io/stats/view"
+	"go.opencensus.io/tag"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/health"
@@ -21,7 +25,22 @@ import (
 
 func init() {
 	view.Register(ocgrpc.DefaultServerViews...)
+	view.Register(accessLogsRequestsView)
 }
+
+var (
+	mAccessLogsRequests    = ocstats.Int64("accesslogs.gloo.solo.io/accesslogs/requests", "The number of requests", "1")
+	requestPathKey, _      = tag.NewKey("request_path")
+	responseCodeKey, _     = tag.NewKey("response_code")
+	clusterKey, _          = tag.NewKey("cluster")
+	accessLogsRequestsView = &view.View{
+		Name:        "accesslogs.gloo.solo.io/accesslogs/requests",
+		Measure:     mAccessLogsRequests,
+		Description: "The number of requests, as noted in access logs (which are lossy)",
+		Aggregation: view.Count(),
+		TagKeys:     []tag.Key{requestPathKey, responseCodeKey, clusterKey},
+	}
+)
 
 func Run() {
 	clientSettings := NewSettings()
@@ -40,18 +59,40 @@ func Run() {
 				switch msg := message.GetLogEntries().(type) {
 				case *pb.StreamAccessLogsMessage_HttpLogs:
 					for _, v := range msg.HttpLogs.LogEntry {
+
+						requestPath := v.GetRequest().GetPath()
+						requestOrigPath := v.GetRequest().GetOriginalPath()
+						requestMethod := v.GetRequest().GetRequestMethod()
+						responseCode := v.GetResponse().GetResponseCode()
+						cluster := v.GetCommonProperties().GetUpstreamCluster()
+						routeName := v.GetCommonProperties().GetRouteName()
+						startTime := v.GetCommonProperties().GetStartTime()
+						timeToLastUpstreamTxByte := v.GetCommonProperties().GetTimeToLastUpstreamTxByte()
+
+						utils.MeasureOne(
+							ctx,
+							mAccessLogsRequests,
+							tag.Insert(requestPathKey, requestPath),
+							tag.Insert(responseCodeKey, string(responseCode.GetValue())),
+							tag.Insert(clusterKey, cluster))
+
 						logger.With(
-							zap.Any("protocol_version", v.ProtocolVersion),
-							zap.Any("request_path", v.Request.Path),
-							zap.Any("request_method", v.Request.RequestMethod),
-							zap.Any("response_status", v.Response.ResponseCode),
+							zap.Any("protocol_version", v.GetProtocolVersion()),
+							zap.Any("request_path", requestPath),
+							zap.Any("request_original_path", requestOrigPath),
+							zap.Any("request_method", requestMethod),
+							zap.Any("response_code", responseCode.GetValue()),
+							zap.Any("cluster", cluster),
+							zap.Any("route_name", routeName),
+							zap.Any("start_time", startTime),
+							zap.Any("time_to_last_upstream_tx_byte", timeToLastUpstreamTxByte),
 						).Info("received http request")
 					}
 				case *pb.StreamAccessLogsMessage_TcpLogs:
 					for _, v := range msg.TcpLogs.LogEntry {
 						logger.With(
-							zap.Any("upstream_cluster", v.CommonProperties.UpstreamCluster),
-							zap.Any("route_name", v.CommonProperties.RouteName),
+							zap.Any("upstream_cluster", v.GetCommonProperties().GetUpstreamCluster()),
+							zap.Any("route_name", v.GetCommonProperties().GetRouteName()),
 						).Info("received tcp request")
 					}
 				}
